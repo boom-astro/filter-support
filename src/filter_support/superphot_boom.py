@@ -2,8 +2,6 @@ import io
 from datetime import datetime
 
 from pymongo import MongoClient
-from slack_sdk import WebClient
-from slack_sdk.errors import SlackApiError
 import pandas as pd
 import numpy as np
 from astropy.coordinates import SkyCoord
@@ -29,37 +27,6 @@ warnings.simplefilter("ignore", category=InconsistentVersionWarning)
 # Load .env from home directory
 # Reading mongodb password
 load_dotenv(Path.home() / ".env")
-
-def post_image_to_slack(file_path, channel_id, message=""):
-    """
-    Post an image to a Slack channel.
-
-    Args:
-        file_path (str): Path to the image file to upload.
-        channel_id (str): Slack channel ID (e.g., 'C0123456789').
-        message (str, optional): Message to accompany the image. Defaults to "".
-
-    Returns:
-        bool: True if successful, False otherwise.
-    """
-    token = os.getenv("SLACK_BOT_TOKEN")
-    if not token:
-        print("SLACK_BOT_TOKEN not found in environment variables")
-        return False
-
-    client = WebClient(token=token)
-
-    try:
-        response = client.files_upload_v2(
-            channel=channel_id,
-            file=file_path,
-            initial_comment=message
-        )
-        print(f"Image posted to Slack: {response['file']['permalink']}")
-        return True
-    except SlackApiError as e:
-        print(f"Slack error: {e.response['error']}")
-        return False
 
 
 def fetch_mongo(collection_name, url="mongodb://localhost:27017", db_name="boom"):
@@ -207,12 +174,10 @@ def run_superphot(ztf_id):
         ztf_id (str): ZTF identifier for the transient to analyze.
 
     Returns:
-        None: Results are saved to disk and printed. Returns early if insufficient data.
-
-    Side Effects:
-        - Saves a diagnostic plot to 'superphot_results/{ztf_id}_superphot.png'
-        - Prints diagnostic information and photometry DataFrame
-        - May print error messages if data is insufficient or processing fails
+        tuple or None: A tuple of (event_dict, image_path) where event_dict contains
+            fit parameters and classification results, and image_path is the path to
+            the saved diagnostic plot (or None if prob <= 0.5). Returns None if
+            processing fails due to insufficient data or errors.
     """
     # Fetch ZTF photometry
     cand_info = fetch_mongo("ZTF_alerts_aux").find_one({"_id": str(ztf_id)})
@@ -393,6 +358,7 @@ def run_superphot(ztf_id):
 
     event_dict['superphot_plus_classified'] = True
 
+    image_path = None
     if event_dict['superphot_plus_prob'] > 0.5:
 
         # Generate diagnostic plot
@@ -411,14 +377,7 @@ def run_superphot(ztf_id):
             f"Probability: {event_dict['superphot_plus_prob']}",
             fontsize=18
         )
-        plt.savefig(f"superphot_results/{ztf_id}_superphot.png")
+        image_path = f"superphot_results/{ztf_id}_superphot.png"
+        plt.savefig(image_path)
 
-        # Post to Slack if channel is configured
-        slack_channel = os.getenv("SLACK_CHANNEL_ID")
-        if slack_channel:
-            post_image_to_slack(
-                f"superphot_results/{ztf_id}_superphot.png",
-                channel_id=slack_channel,
-                message=f"Superphot results for {ztf_id}: {event_dict['superphot_plus_class']} (prob: {event_dict['superphot_plus_prob']})"
-            )
-    return None
+    return event_dict, image_path

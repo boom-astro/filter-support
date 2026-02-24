@@ -1,9 +1,12 @@
 import io
+import base64
+import json
 from datetime import datetime
 
 from pymongo import MongoClient
 import pandas as pd
 import numpy as np
+import requests
 from astropy.coordinates import SkyCoord
 import astropy.units as u
 import dustmaps.sfd
@@ -156,6 +159,54 @@ def evaluate_cal_probs(model, orig_features):
         ia_prob = 0.0
         
     return probs.idxmax(), probs.max(), ia_prob
+
+
+def post_to_fritz(
+    event_dict,
+    image_path,
+    ztf_id,
+    token=os.getenv("ORCUS_TOKEN"),
+    base_url="https://orcusgate.org/api",
+):
+    """
+    Post classification results and diagnostic plot to a Fritz/SkyPortal instance.
+
+    Posts the event_dict as a JSON-formatted comment on the source, with the
+    diagnostic plot attached as an image.
+
+    Args:
+        event_dict (dict): Classification results and fit parameters.
+        image_path (str or None): Path to the diagnostic plot image.
+        ztf_id (str): ZTF identifier used as the source ID on Fritz.
+        token (str): Fritz API token for authentication.
+        base_url (str): Base URL of the Fritz API.
+
+    Returns:
+        dict: API response JSON on success.
+
+    Raises:
+        requests.HTTPError: If the API request fails.
+    """
+    headers = {
+        "Authorization": f"token {token}",
+        "Content-Type": "application/json",
+    }
+
+    endpoint = f"{base_url}/sources/{ztf_id}/comments"
+
+    payload = {"text": json.dumps(event_dict, indent=2)}
+
+    if image_path and os.path.exists(image_path):
+        with open(image_path, "rb") as f:
+            image_data = base64.b64encode(f.read()).decode("utf-8")
+        payload["attachment"] = {
+            "body": image_data,
+            "name": os.path.basename(image_path),
+        }
+
+    response = requests.post(endpoint, json=payload, headers=headers)
+    response.raise_for_status()
+    return response.json()
 
 
 def run_superphot(ztf_id):
@@ -379,5 +430,12 @@ def run_superphot(ztf_id):
         )
         image_path = f"superphot_results/{ztf_id}_superphot.png"
         plt.savefig(image_path)
+
+    # Post results to Fritz
+    try:
+        fritz_response = post_to_fritz(event_dict, image_path, ztf_id)
+        print(f"Posted to Fritz for {ztf_id}: {fritz_response}")
+    except requests.HTTPError as e:
+        print(f"Failed to post to Fritz for {ztf_id}: {e}")
 
     return event_dict, image_path

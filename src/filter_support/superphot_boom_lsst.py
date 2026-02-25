@@ -1,6 +1,7 @@
 import io
 import base64
 import json
+import logging
 from datetime import datetime
 
 from pymongo import MongoClient
@@ -26,6 +27,20 @@ import warnings
 from sklearn.exceptions import InconsistentVersionWarning
 
 warnings.simplefilter("ignore", category=InconsistentVersionWarning)
+
+logger = logging.getLogger(__name__)
+
+
+class NumpyEncoder(json.JSONEncoder):
+    """JSON encoder that handles numpy types."""
+    def default(self, obj):
+        if isinstance(obj, (np.integer,)):
+            return int(obj)
+        if isinstance(obj, (np.floating,)):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super().default(obj)
 
 # Load .env from home directory
 # Reading mongodb password
@@ -135,7 +150,7 @@ def evaluate_cal_probs(model, orig_features):
         tuple: A tuple containing:
             - str: Best predicted supernova class
             - float: Probability of the best class
-            - float: Probability of SN Ia classification (0.0 if not predicted)
+            - dict: Probabilities for all classes (keyed by class name)
     """
     allowed_types = ['SLSN-I', 'SN Ia', 'SN Ibc', 'SN II', 'SN IIn']
     input_features = model.best_model.feature_name_
@@ -152,19 +167,17 @@ def evaluate_cal_probs(model, orig_features):
     # Calculate probability as fraction of fits where each class is best
     # (frequentist interpretation for better calibration)
     probs = best_classes.value_counts() / best_classes.count()
-    
-    try:
-        ia_prob = probs[probs.index == "SN Ia"].iloc[0]
-    except (KeyError, IndexError):
-        ia_prob = 0.0
-        
-    return probs.idxmax(), probs.max(), ia_prob
+
+    # Build dict with all class probabilities (0.0 for classes not voted best)
+    all_probs = {cls: probs.get(cls, 0.0) for cls in allowed_types}
+
+    return probs.idxmax(), probs.max(), all_probs
 
 
 def post_to_fritz(
     event_dict,
     image_path,
-    ztf_id,
+    lsst_id,
     token=os.getenv("ORCUS_TOKEN"),
     base_url="https://orcusgate.org/api",
 ):
@@ -177,7 +190,7 @@ def post_to_fritz(
     Args:
         event_dict (dict): Classification results and fit parameters.
         image_path (str or None): Path to the diagnostic plot image.
-        ztf_id (str): ZTF identifier used as the source ID on Fritz.
+        lsst_id (str): LSST identifier used as the source ID on Fritz.
         token (str): Fritz API token for authentication.
         base_url (str): Base URL of the Fritz API.
 
@@ -192,9 +205,61 @@ def post_to_fritz(
         "Content-Type": "application/json",
     }
 
-    endpoint = f"{base_url}/sources/{ztf_id}/comments"
+    endpoint = f"{base_url}/sources/{lsst_id}/comments"
 
-    payload = {"text": json.dumps(event_dict, indent=2)}
+    best_class = event_dict.get("superphot_plus_class", event_dict.get("superphot_plus_class_without_redshift"))
+    best_prob = event_dict.get("superphot_plus_prob", event_dict.get("superphot_plus_prob_without_redshift"))
+    payload = {"text": f"Superphot+ Classification: {best_class} (Probability: {best_prob})"}
+
+    response = requests.post(endpoint, json=payload, headers=headers)
+    response.raise_for_status()
+    return response.json()
+
+
+def post_to_fritz_with_replace(
+    event_dict,
+    image_path,
+    lsst_id,
+    previous_comment_id=None,
+    token=os.getenv("ORCUS_TOKEN"),
+    base_url="https://orcusgate.org/api",
+):
+    """Post results to Fritz, replacing a previous comment if one exists.
+
+    Deletes the old comment (if provided) then posts a new one with the
+    latest classification results and diagnostic plot.
+
+    Args:
+        event_dict (dict): Classification results and fit parameters.
+        image_path (str or None): Path to the diagnostic plot image.
+        lsst_id (str): LSST identifier used as the source ID on Fritz.
+        previous_comment_id (int or None): Fritz comment_id to delete before posting.
+        token (str): Fritz API token for authentication.
+        base_url (str): Base URL of the Fritz API.
+
+    Returns:
+        int or None: The comment_id of the newly created comment.
+    """
+    headers = {
+        "Authorization": f"token {token}",
+        "Content-Type": "application/json",
+    }
+
+    # Delete old comment if it exists
+    if previous_comment_id is not None:
+        delete_url = f"{base_url}/sources/{lsst_id}/comments/{previous_comment_id}"
+        try:
+            del_resp = requests.delete(delete_url, headers=headers)
+            del_resp.raise_for_status()
+            logger.info("[%s] Deleted previous Fritz comment %s", lsst_id, previous_comment_id)
+        except requests.HTTPError as e:
+            logger.warning("[%s] Could not delete comment %s: %s", lsst_id, previous_comment_id, e)
+
+    # Create new comment
+    endpoint = f"{base_url}/sources/{lsst_id}/comments"
+    best_class = event_dict.get("superphot_plus_class", event_dict.get("superphot_plus_class_without_redshift"))
+    best_prob = event_dict.get("superphot_plus_prob", event_dict.get("superphot_plus_prob_without_redshift"))
+    payload = {"text": f"Superphot+ Classification: {best_class} (Probability: {best_prob})"}
 
     if image_path and os.path.exists(image_path):
         with open(image_path, "rb") as f:
@@ -205,16 +270,19 @@ def post_to_fritz(
         }
 
     response = requests.post(endpoint, json=payload, headers=headers)
+    if not response.ok:
+        logger.error("[%s] Fritz comment failed (%s): %s", lsst_id, response.status_code, response.text)
     response.raise_for_status()
-    return response.json()
+    resp_json = response.json()
+    return resp_json.get("data", {}).get("comment_id")
 
 
-def run_superphot(ztf_id):
+def run_superphot(lsst_id):
     """
     Run the complete Superphot Plus analysis pipeline for a given transient.
 
     This function performs the following steps:
-    1. Fetches photometry data from MongoDB for ZTF and optionally LSST
+    1. Fetches photometry data from MongoDB for LSST and optionally ZTF
     2. Processes and combines multi-survey photometry
     3. Applies extinction correction and phase calculation
     4. Fits light curves using Superphot Plus SVI sampler
@@ -222,7 +290,7 @@ def run_superphot(ztf_id):
     6. Generates and saves a diagnostic plot
 
     Args:
-        ztf_id (str): ZTF identifier for the transient to analyze.
+        lsst_id (str): LSST identifier for the transient to analyze.
 
     Returns:
         tuple or None: A tuple of (event_dict, image_path) where event_dict contains
@@ -230,27 +298,27 @@ def run_superphot(ztf_id):
             the saved diagnostic plot (or None if prob <= 0.5). Returns None if
             processing fails due to insufficient data or errors.
     """
-    # Fetch ZTF photometry
-    cand_info = fetch_mongo("ZTF_alerts_aux").find_one({"_id": str(ztf_id)})
+    # Fetch LSST photometry
+    cand_info = fetch_mongo("LSST_alerts_aux").find_one({"_id": str(lsst_id)})
     if cand_info is None:
-        print(f"No data found for {ztf_id}")
+        logger.warning("No data found for %s", lsst_id)
         return
-    df_ztf = process_photometry(cand_info, "ZTF")
-    
-    # Attempt to fetch and combine LSST photometry if available
-    if len(cand_info["aliases"]["LSST"]) != 0:
-        lsst_id = cand_info["aliases"]["LSST"][0]
-        lsst_cand_info = fetch_mongo("LSST_alerts_aux").find_one({"_id": str(lsst_id)})
-        df_lsst = process_photometry(lsst_cand_info, "LSST")
+    df_lsst = process_photometry(cand_info, "LSST")
 
-        # Only include LSST data if it has sufficient coverage in both filters
-        if (len(df_lsst.loc[df_lsst["filter"] == "r"]) >= 2 and
-            len(df_lsst.loc[df_lsst["filter"] == "g"]) >= 2):
-            df_final = pd.concat([df_ztf, df_lsst])
+    # Attempt to fetch and combine ZTF photometry if available
+    if len(cand_info["aliases"]["ZTF"]) != 0:
+        ztf_id = cand_info["aliases"]["ZTF"][0]
+        ztf_cand_info = fetch_mongo("ZTF_alerts_aux").find_one({"_id": str(ztf_id)})
+        df_ztf = process_photometry(ztf_cand_info, "ZTF")
+
+        # Only include ZTF data if it has sufficient coverage in both filters
+        if (len(df_ztf.loc[df_ztf["filter"] == "r"]) >= 2 and
+            len(df_ztf.loc[df_ztf["filter"] == "g"]) >= 2):
+            df_final = pd.concat([df_lsst, df_ztf])
         else:
-            df_final = df_ztf
+            df_final = df_lsst
     else:
-        df_final = df_ztf
+        df_final = df_lsst
 
     # Filter to only r and g bands
     df_final = df_final.loc[df_final['filter'].isin(["r", "g"])]
@@ -259,15 +327,17 @@ def run_superphot(ztf_id):
     # Check for minimum data requirements
     if (len(df_final.loc[df_final["filter"] == "r"]) <= 2 or
         len(df_final.loc[df_final["filter"] == "g"]) <= 2):
-        print(f"Not Enough Points {ztf_id}")
+        logger.warning("Not enough points for %s", lsst_id)
         return
 
     # Add filter metadata for SNAPI
     df_final['filt_center'] = np.where(df_final['filter'] == 'r', 6366.38, 4746.48)
     df_final['filt_width'] = np.where(df_final['filter'] == 'r', 1553.43, 1317.15)
     df_final['filter'] = np.where(df_final['filter'] == 'r', 'ZTF_r', 'ZTF_g')
-    df_final['zeropoint'] = 23.90  # AB mag
+    df_final['zeropoint'] = 8.9  # AB mag
     df_final['upper_limit'] = False
+
+    df_final = df_final.loc[df_final["type"] == "alert"]
 
     # Create SNAPI photometry object
     phot = Photometry(df_final)
@@ -287,7 +357,7 @@ def run_superphot(ztf_id):
 
     # Check if we have valid detections after truncation
     if phot.detections.empty or phot.detections['flux'].dropna().empty:
-        print(f"No valid detections after truncation for {ztf_id}")
+        logger.warning("No valid detections after truncation for %s", lsst_id)
         return
 
     # Apply Milky Way extinction correction
@@ -309,7 +379,7 @@ def run_superphot(ztf_id):
     for filt in phot._unique_filters:
         filt_data = phot.detections[phot.detections['filter'] == filt]
         if filt_data.empty:
-            print(f"Filter {filt} has no data after normalization for {ztf_id}")
+            logger.warning("Filter %s has no data after normalization for %s", filt, lsst_id)
             return
 
     # Pad light curves to nearest power of 2 for model input
@@ -339,17 +409,17 @@ def run_superphot(ztf_id):
             num_iter=3000,
             random_state=random_seed)
     except:
-        print("Problems with SVI Sampler. Skipping event")
+        logger.error("Problems with SVI Sampler. Skipping %s", lsst_id)
         return
     
 
     svi_sampler.fit_photometry(padded_phot, orig_num_times=orig_size)
     res = svi_sampler.result
 
-    # Store fit parameters
+    # Store fit parameters (convert numpy types to native Python for JSON serialization)
     event_dict = {}
     for param in res.fit_parameters.columns:
-        event_dict[f'superphot_plus_{param}'] = res.fit_parameters[param].median()
+        event_dict[f'superphot_plus_{param}'] = float(res.fit_parameters[param].median())
 
     # Filter fits by quality score
     score_cutoff = 1.2
@@ -359,20 +429,20 @@ def run_superphot(ztf_id):
         valid_fits = res.fit_parameters
     
     if valid_fits.empty:
-        print(f"Empty fits for {ztf_id}")
-        return None
+        logger.warning("Empty fits for %s", lsst_id)
+        return None, None
     
     try:
         # Identify early-phase fits (all observations before piecewise transition)
         early_fit_mask = (valid_fits['gamma_ZTF_r'] + valid_fits['t_0_ZTF_r'] > 
                           np.max(phot.times))
     except UnboundLocalError:
-        print(f"No valid returns {ztf_id}")
-        return
+        logger.warning("No valid returns for %s", lsst_id)
+        return None, None
 
     # Convert fit parameters to uncorrelated Gaussian draws
     uncorr_fits = priors.reverse_transform(valid_fits)
-    event_dict['name'] = ztf_id
+    event_dict['name'] = str(lsst_id)
     uncorr_fits.index = [event_dict['name']] * len(uncorr_fits)
 
     
@@ -391,21 +461,24 @@ def run_superphot(ztf_id):
     # Classify using appropriate model (early vs. full phase)
     if len(valid_fits[early_fit_mask]) > len(valid_fits[~early_fit_mask]):
         # Use early-phase classifier
-        class_noz, prob_noz, ia_prob_noz = evaluate_cal_probs(early_model, uncorr_fits)
+        class_noz, prob_noz, all_probs_noz = evaluate_cal_probs(early_model, uncorr_fits)
         event_dict['superphot_plus_classifier'] = 'early_lightgbm_02_2025'
     else:
         # Use full-phase classifier
-        class_noz, prob_noz, ia_prob_noz = evaluate_cal_probs(full_model, uncorr_fits)
+        class_noz, prob_noz, all_probs_noz = evaluate_cal_probs(full_model, uncorr_fits)
         event_dict['superphot_plus_classifier'] = 'full_lightgbm_02_2025'
 
     # Store classification results
     if ~np.isnan(redshift):
         event_dict['superphot_plus_class_without_redshift'] = class_noz
-        event_dict['superphot_plus_prob_without_redshift'] = np.round(prob_noz, 3)
+        event_dict['superphot_plus_prob_without_redshift'] = float(np.round(prob_noz, 3))
     else:
         event_dict['superphot_plus_class'] = class_noz
-        event_dict['superphot_plus_prob'] = np.round(prob_noz, 3)
-        event_dict['superphot_non_Ia_prob'] = 1. - np.round(ia_prob_noz, 3)
+        event_dict['superphot_plus_prob'] = float(np.round(prob_noz, 3))
+
+    # Store per-class probabilities
+    for cls, cls_prob in all_probs_noz.items():
+        event_dict[f'superphot_plus_prob_{cls}'] = float(np.round(cls_prob, 3))
 
     event_dict['superphot_plus_classified'] = True
 
@@ -424,18 +497,11 @@ def run_superphot(ztf_id):
         ax.tick_params(axis='both', which='major', labelsize=15)
         ax.legend()
         plt.title(
-            f"{ztf_id}, Class: {event_dict['superphot_plus_class']}, "
+            f"{lsst_id}, Class: {event_dict['superphot_plus_class']}, "
             f"Probability: {event_dict['superphot_plus_prob']}",
             fontsize=18
         )
-        image_path = f"superphot_results/{ztf_id}_superphot.png"
+        image_path = f"superphot_results/{lsst_id}_superphot.png"
         plt.savefig(image_path)
-
-    # Post results to Fritz
-    try:
-        fritz_response = post_to_fritz(event_dict, image_path, ztf_id)
-        print(f"Posted to Fritz for {ztf_id}: {fritz_response}")
-    except requests.HTTPError as e:
-        print(f"Failed to post to Fritz for {ztf_id}: {e}")
 
     return event_dict, image_path

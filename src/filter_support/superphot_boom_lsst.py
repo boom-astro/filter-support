@@ -174,6 +174,57 @@ def evaluate_cal_probs(model, orig_features):
     return probs.idxmax(), probs.max(), all_probs
 
 
+def annotate_fritz(
+    event_dict,
+    lsst_id,
+    group_ids=None,
+    origin="superphot_plus",
+    token=os.getenv("ORCUS_TOKEN"),
+    base_url="https://orcusgate.org/api",
+):
+    """
+    Post per-class probability annotations to Fritz/SkyPortal.
+
+    Args:
+        event_dict (dict): Classification results containing per-class probabilities.
+        lsst_id (str): LSST identifier used as the source ID on Fritz.
+        group_ids (list of int or None): Group IDs that can view the annotation.
+        origin (str): Origin label for the annotation.
+        token (str): Fritz API token for authentication.
+        base_url (str): Base URL of the Fritz API.
+
+    Returns:
+        dict: API response JSON.
+    """
+    headers = {
+        "Authorization": f"token {token}",
+        "Content-Type": "application/json",
+    }
+
+    allowed_types = ['SLSN-I', 'SN Ia', 'SN Ibc', 'SN II', 'SN IIn']
+    data = {cls: event_dict.get(f'superphot_plus_prob_{cls}', 0.0) for cls in allowed_types}
+
+    payload = {
+        "origin": origin,
+        "data": data,
+    }
+    if group_ids is not None:
+        payload["group_ids"] = group_ids
+
+    endpoint = f"{base_url}/sources/{lsst_id}/annotations"
+    response = requests.post(endpoint, json=payload, headers=headers)
+
+    resp_json = response.json()
+    if resp_json.get("status") == "success":
+        logger.info("[%s] Annotation added.", lsst_id)
+    elif resp_json.get("message", "").startswith("Annotation already exists"):
+        logger.warning("[%s] Annotation already exists.", lsst_id)
+    else:
+        logger.error("[%s] Error adding annotation: %s", lsst_id, resp_json.get("message"))
+
+    return resp_json
+
+
 def post_to_fritz(
     event_dict,
     image_path,

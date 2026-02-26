@@ -2,7 +2,7 @@ import os
 import json
 import io
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from dataclasses import dataclass
 
 import fastavro
@@ -148,7 +148,7 @@ def consume():
                 if result is not None:
                     event_dict, image_path = result
                     if event_dict is not None:
-                        event_dict['result_timestamp'] = datetime.now(datetime.timezone.utc).isoformat()
+                        event_dict['result_timestamp'] = datetime.now(timezone.utc).isoformat()
 
                         row = pd.DataFrame([event_dict])
                         row.to_csv(CSV_FILE, mode="a", index=False, header=not header_written)

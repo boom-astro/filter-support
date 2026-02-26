@@ -16,6 +16,7 @@ from superphot_plus.samplers.numpyro_sampler import SVISampler
 from superphot_plus.priors import SuperphotPrior
 from superphot_plus.model import SuperphotLightGBM
 import matplotlib.pyplot as plt
+import jax
 
 from snapi import Photometry, Formatter
 import os
@@ -491,12 +492,11 @@ def run_superphot(lsst_id):
             priors=priors,
             num_iter=3000,
             random_state=random_seed)
-    except:
-        logger.error("Problems with SVI Sampler. Skipping %s", lsst_id)
-        return
-    
+        svi_sampler.fit_photometry(padded_phot, orig_num_times=orig_size)
+    except Exception:
+        logger.exception("SVI sampler failed for %s", lsst_id)
+        return None, None
 
-    svi_sampler.fit_photometry(padded_phot, orig_num_times=orig_size)
     res = svi_sampler.result
 
     # Store fit parameters (convert numpy types to native Python for JSON serialization)
@@ -586,5 +586,10 @@ def run_superphot(lsst_id):
         )
         image_path = f"superphot_results/{lsst_id}_superphot.png"
         plt.savefig(image_path)
+        plt.close(fig)
+
+    import gc
+    gc.collect()
+    jax.clear_caches()
 
     return event_dict, image_path

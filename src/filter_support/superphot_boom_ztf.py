@@ -149,30 +149,82 @@ def evaluate_cal_probs(model, orig_features):
         tuple: A tuple containing:
             - str: Best predicted supernova class
             - float: Probability of the best class
-            - float: Probability of SN Ia classification (0.0 if not predicted)
+            - dict: Probabilities for all classes (keyed by class name)
     """
     allowed_types = ['SLSN-I', 'SN Ia', 'SN Ibc', 'SN II', 'SN IIn']
     input_features = model.best_model.feature_name_
     test_features = model.normalize(orig_features[input_features])
-    
+
     probabilities = pd.DataFrame(
         model.best_model.predict_proba(test_features),
         index=test_features.index
     )
-    
+
     probabilities.columns = np.sort(allowed_types)
     best_classes = probabilities.idxmax(axis=1)
-    
+
     # Calculate probability as fraction of fits where each class is best
     # (frequentist interpretation for better calibration)
     probs = best_classes.value_counts() / best_classes.count()
-    
-    try:
-        ia_prob = probs[probs.index == "SN Ia"].iloc[0]
-    except (KeyError, IndexError):
-        ia_prob = 0.0
-        
-    return probs.idxmax(), probs.max(), ia_prob
+
+    # Build dict with all class probabilities (0.0 for classes not voted best)
+    all_probs = {cls: probs.get(cls, 0.0) for cls in allowed_types}
+
+    return probs.idxmax(), probs.max(), all_probs
+
+
+def annotate_fritz(
+    event_dict,
+    ztf_id,
+    previous_annotation_id=None,
+    group_ids=None,
+    origin="superphot_plus",
+    token=os.getenv("ORCUS_TOKEN"),
+    base_url="https://orcusgate.org/api",
+):
+    """Post or update per-class probability annotations on Fritz/SkyPortal.
+
+    Args:
+        event_dict (dict): Classification results containing per-class probabilities.
+        ztf_id (str): ZTF identifier used as the source ID on Fritz.
+        previous_annotation_id (int or None): Annotation ID to update via PUT. If None, POST a new one.
+        group_ids (list of int or None): Group IDs that can view the annotation.
+        origin (str): Origin label for the annotation.
+        token (str): Fritz API token for authentication.
+        base_url (str): Base URL of the Fritz API.
+
+    Returns:
+        int or None: The annotation_id of the created/updated annotation.
+    """
+    headers = {
+        "Authorization": f"token {token}",
+        "Content-Type": "application/json",
+    }
+
+    allowed_types = ['SLSN-I', 'SN Ia', 'SN Ibc', 'SN II', 'SN IIn']
+    data = {cls: event_dict.get(f'superphot_plus_prob_{cls}', 0.0) for cls in allowed_types}
+
+    payload = {
+        "origin": origin,
+        "data": data,
+    }
+    if group_ids is not None:
+        payload["group_ids"] = group_ids
+
+    if previous_annotation_id is not None:
+        endpoint = f"{base_url}/sources/{ztf_id}/annotations/{previous_annotation_id}"
+        response = requests.put(endpoint, json=payload, headers=headers)
+    else:
+        endpoint = f"{base_url}/sources/{ztf_id}/annotations"
+        response = requests.post(endpoint, json=payload, headers=headers)
+
+    resp_json = response.json()
+    if resp_json.get("status") == "success":
+        logger.info("[%s] Annotation saved.", ztf_id)
+    else:
+        logger.error("[%s] Annotation error: %s", ztf_id, resp_json.get("message"))
+
+    return resp_json.get("data", {}).get("annotation_id")
 
 
 def post_to_fritz(
@@ -450,11 +502,11 @@ def run_superphot(ztf_id):
     # Classify using appropriate model (early vs. full phase)
     if len(valid_fits[early_fit_mask]) > len(valid_fits[~early_fit_mask]):
         # Use early-phase classifier
-        class_noz, prob_noz, ia_prob_noz = evaluate_cal_probs(early_model, uncorr_fits)
+        class_noz, prob_noz, all_probs_noz = evaluate_cal_probs(early_model, uncorr_fits)
         event_dict['superphot_plus_classifier'] = 'early_lightgbm_02_2025'
     else:
         # Use full-phase classifier
-        class_noz, prob_noz, ia_prob_noz = evaluate_cal_probs(full_model, uncorr_fits)
+        class_noz, prob_noz, all_probs_noz = evaluate_cal_probs(full_model, uncorr_fits)
         event_dict['superphot_plus_classifier'] = 'full_lightgbm_02_2025'
 
     # Store classification results
@@ -464,7 +516,10 @@ def run_superphot(ztf_id):
     else:
         event_dict['superphot_plus_class'] = class_noz
         event_dict['superphot_plus_prob'] = float(np.round(prob_noz, 3))
-        event_dict['superphot_non_Ia_prob'] = float(1. - np.round(ia_prob_noz, 3))
+
+    # Store per-class probabilities
+    for cls, cls_prob in all_probs_noz.items():
+        event_dict[f'superphot_plus_prob_{cls}'] = float(np.round(cls_prob, 3))
 
     event_dict['superphot_plus_classified'] = True
 

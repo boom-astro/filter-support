@@ -177,24 +177,25 @@ def evaluate_cal_probs(model, orig_features):
 def annotate_fritz(
     event_dict,
     lsst_id,
+    previous_annotation_id=None,
     group_ids=None,
     origin="superphot_plus",
     token=os.getenv("ORCUS_TOKEN"),
     base_url="https://orcusgate.org/api",
 ):
-    """
-    Post per-class probability annotations to Fritz/SkyPortal.
+    """Post or update per-class probability annotations on Fritz/SkyPortal.
 
     Args:
         event_dict (dict): Classification results containing per-class probabilities.
         lsst_id (str): LSST identifier used as the source ID on Fritz.
+        previous_annotation_id (int or None): Annotation ID to update via PUT. If None, POST a new one.
         group_ids (list of int or None): Group IDs that can view the annotation.
         origin (str): Origin label for the annotation.
         token (str): Fritz API token for authentication.
         base_url (str): Base URL of the Fritz API.
 
     Returns:
-        dict: API response JSON.
+        int or None: The annotation_id of the created/updated annotation.
     """
     headers = {
         "Authorization": f"token {token}",
@@ -211,18 +212,20 @@ def annotate_fritz(
     if group_ids is not None:
         payload["group_ids"] = group_ids
 
-    endpoint = f"{base_url}/sources/{lsst_id}/annotations"
-    response = requests.post(endpoint, json=payload, headers=headers)
+    if previous_annotation_id is not None:
+        endpoint = f"{base_url}/sources/{lsst_id}/annotations/{previous_annotation_id}"
+        response = requests.put(endpoint, json=payload, headers=headers)
+    else:
+        endpoint = f"{base_url}/sources/{lsst_id}/annotations"
+        response = requests.post(endpoint, json=payload, headers=headers)
 
     resp_json = response.json()
     if resp_json.get("status") == "success":
-        logger.info("[%s] Annotation added.", lsst_id)
-    elif resp_json.get("message", "").startswith("Annotation already exists"):
-        logger.warning("[%s] Annotation already exists.", lsst_id)
+        logger.info("[%s] Annotation saved.", lsst_id)
     else:
-        logger.error("[%s] Error adding annotation: %s", lsst_id, resp_json.get("message"))
+        logger.error("[%s] Annotation error: %s", lsst_id, resp_json.get("message"))
 
-    return resp_json
+    return resp_json.get("data", {}).get("annotation_id")
 
 
 def post_to_fritz(

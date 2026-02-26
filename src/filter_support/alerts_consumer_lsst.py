@@ -103,6 +103,7 @@ logger.info("Subscribed to topic: %s", KAFKA_TOPIC)
 def consume():
     logger.info("Listening for messages...")
     total_consumed = 0
+    consecutive_empty_polls = 0
     header_written = os.path.exists(CSV_FILE)
     source_trackers = load_state()
 
@@ -110,12 +111,25 @@ def consume():
         while True:
             msg = consumer.poll(timeout=10.0)
             if msg is None:
+                consecutive_empty_polls += 1
+                if consecutive_empty_polls % 6 == 1:
+                    logger.info("No new messages (idle for ~%ds, consumed %d so far)",
+                                consecutive_empty_polls * 10, total_consumed)
                 continue
+            consecutive_empty_polls = 0
             if msg.error():
                 logger.error("Consumer error: %s", msg.error())
                 continue
 
+            logger.debug("Received message: topic=%s partition=%s offset=%s",
+                         msg.topic(), msg.partition(), msg.offset())
+
             record = read_avro(msg)
+            if record is None:
+                logger.error("Failed to deserialize Avro message at offset %s", msg.offset())
+                total_consumed += 1
+                consumer.commit(message=msg)
+                continue
 
             for cutout_type, _ in thumbnail_types:
                 del record[cutout_type]
@@ -132,6 +146,7 @@ def consume():
             if passes_filter:
                 if lsst_id not in source_trackers:
                     source_trackers[lsst_id] = SourceTracker()
+                    logger.info("[%s] New source, now tracking %d unique sources", lsst_id, len(source_trackers))
 
                 tracker = source_trackers[lsst_id]
                 tracker.total_alerts += 1
@@ -147,6 +162,8 @@ def consume():
 
                 if result is not None:
                     event_dict, image_path = result
+                    if event_dict is None:
+                        logger.warning("[%s] run_superphot returned empty classification", lsst_id)
                     if event_dict is not None:
                         event_dict['result_timestamp'] = datetime.now(timezone.utc).isoformat()
 
@@ -178,11 +195,13 @@ def consume():
                     logger.warning("[%s] run_superphot returned no result", lsst_id)
 
                 save_state(source_trackers)
+                logger.debug("[%s] State saved to %s", lsst_id, STATE_FILE)
             else:
                 logger.debug("Alert %d didn't pass %s", total_consumed, FILTER_NAME)
 
             total_consumed += 1
             consumer.commit(message=msg)
+            logger.debug("Committed offset %s (total consumed: %d)", msg.offset(), total_consumed)
 
     except KeyboardInterrupt:
         logger.info("Shutting down...")

@@ -174,6 +174,21 @@ def evaluate_cal_probs(model, orig_features):
     return probs.idxmax(), probs.max(), all_probs
 
 
+def _get_annotation_id(lsst_id, origin, headers, base_url):
+    """Fetch the annotation ID for a source by origin."""
+    endpoint = f"{base_url}/sources/{lsst_id}/annotations"
+    try:
+        response = requests.get(endpoint, headers=headers)
+        resp_json = response.json()
+        if resp_json.get("status") == "success":
+            for ann in resp_json.get("data", []):
+                if ann.get("origin") == origin:
+                    return ann.get("annotation_id") or ann.get("id")
+    except Exception:
+        logger.exception("[%s] Failed to fetch existing annotations", lsst_id)
+    return None
+
+
 def annotate_fritz(
     event_dict,
     lsst_id,
@@ -220,12 +235,26 @@ def annotate_fritz(
         response = requests.post(endpoint, json=payload, headers=headers)
 
     resp_json = response.json()
+    data_resp = resp_json.get("data", {})
+
     if resp_json.get("status") == "success":
         logger.info("[%s] Annotation saved.", lsst_id)
-    else:
-        logger.error("[%s] Annotation error: %s", lsst_id, resp_json.get("message"))
+        return data_resp.get("annotation_id") or data_resp.get("id")
 
-    return resp_json.get("data", {}).get("annotation_id")
+    # POST likely failed due to duplicate — fetch existing annotation and PUT
+    logger.warning("[%s] Annotation POST failed: %s", lsst_id, resp_json.get("message"))
+    if previous_annotation_id is None:
+        existing_id = _get_annotation_id(lsst_id, origin, headers, base_url)
+        if existing_id is not None:
+            endpoint = f"{base_url}/sources/{lsst_id}/annotations/{existing_id}"
+            retry = requests.put(endpoint, json=payload, headers=headers)
+            retry_json = retry.json()
+            if retry_json.get("status") == "success":
+                logger.info("[%s] Annotation updated via fallback PUT.", lsst_id)
+                return existing_id
+            logger.error("[%s] Fallback PUT failed: %s", lsst_id, retry_json.get("message"))
+
+    return None
 
 
 def post_to_fritz(
@@ -375,7 +404,7 @@ def run_superphot(lsst_id):
         df_final = df_lsst
 
     # Filter to only r and g bands
-    df_final = df_final.loc[df_final['filter'].isin(["r", "g"])]
+    df_final = df_final.loc[df_final['filter'].isin(["r", "g"])].copy()
     df_final.reset_index(drop=True, inplace=True)
 
     # Check for minimum data requirements

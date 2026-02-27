@@ -61,21 +61,15 @@ The two Kafka consumers run independently and can operate simultaneously:
 | | LSST | ZTF |
 |---|---|---|
 | Topic | `LSST_alerts_results` | `ZTF_alerts_results` |
-| Alert threshold | 8 new alerts | 3 new alerts |
-| Max runs/night | 3 per source | 3 per source |
-| Night boundary | 6 PM US/Central | 6 PM US/Central |
 | CSV output | `superphot_results_lsst.csv` | `superphot_results_ztf.csv` |
 | State file | `consumer_state_lsst.json` | `consumer_state_ztf.json` |
 | Log file | `superphot_lsst.log` | `superphot_ztf.log` |
 
 Each consumer:
-- Runs superphot immediately on the first alert for a source
-- Subsequently waits for N new alerts before re-running
-- Limits to 3 superphot runs per source per night
+- Runs superphot on every alert that passes the filter
 - Posts/updates annotations on Fritz with per-class probabilities
 - Posts/replaces comments with best class and probability
 - Persists state to JSON for crash recovery
-- Resets all counters at 6 PM Central (night boundary)
 
 ## Fritz/SkyPortal Integration
 

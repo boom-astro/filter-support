@@ -88,6 +88,8 @@ The `annotate_fritz()` function handles both creation and update: if a POST fail
 
 ## Setup
 
+**Note:** This pipeline can only be run from a machine with access to the [BOOM](https://github.com/boom-astro) database (MongoDB) and the Kafka alert streams (`LSST_alerts_results`, `ZTF_alerts_results`).
+
 ### Requirements
 
 - Python >= 3.11

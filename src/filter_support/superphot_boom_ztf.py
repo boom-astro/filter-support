@@ -1,3 +1,4 @@
+import base64
 import io
 import json
 import logging
@@ -343,6 +344,14 @@ def post_to_fritz_with_replace(
     best_class = event_dict.get("superphot_plus_class", event_dict.get("superphot_plus_class_without_redshift"))
     best_prob = event_dict.get("superphot_plus_prob", event_dict.get("superphot_plus_prob_without_redshift"))
     payload = {"text": f"Superphot+ Classification: {best_class} (Probability: {best_prob})"}
+
+    if image_path and os.path.exists(image_path):
+        with open(image_path, "rb") as f:
+            image_data = base64.b64encode(f.read()).decode("utf-8")
+        payload["attachment"] = {
+            "body": image_data,
+            "name": os.path.basename(image_path),
+        }
 
     response = requests.post(endpoint, json=payload, headers=headers)
     response.raise_for_status()

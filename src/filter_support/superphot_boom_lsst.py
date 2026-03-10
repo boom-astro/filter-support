@@ -593,3 +593,262 @@ def run_superphot(lsst_id):
     jax.clear_caches()
 
     return event_dict, image_path
+
+
+def run_superphot_from_csv(csv_path):
+    """
+    Run the Superphot Plus pipeline on photometry loaded from a local CSV file.
+
+    The CSV is expected to have ZTF-format columns including at least:
+    jd, fid (1=g, 2=r), magpsf, sigmapsf, ra, dec, obj_id.
+
+    Args:
+        csv_path (str or Path): Path to the photometry CSV file.
+
+    Returns:
+        tuple or None: (event_dict, image_path) on success, None on failure.
+    """
+    csv_path = Path(csv_path)
+    source_id = csv_path.stem
+
+    raw = pd.read_csv(csv_path)
+
+    # Keep only rows with valid photometry
+    raw = raw.dropna(subset=["magpsf", "sigmapsf"])
+    if raw.empty:
+        logger.warning("[%s] No valid photometry rows in CSV", source_id)
+        return None
+
+    # Map fid to filter name
+    fid_map = {1: "g", 2: "r"}
+    raw["filter"] = raw["fid"].map(fid_map)
+    raw = raw.dropna(subset=["filter"])
+
+    df_final = pd.DataFrame({
+        "mjd": raw["jd"] - 2400000.5,
+        "mag": raw["magpsf"],
+        "mag_err": raw["sigmapsf"],
+        "filter": raw["filter"],
+    })
+
+    # Filter to only r and g bands
+    df_final = df_final.loc[df_final["filter"].isin(["r", "g"])].copy()
+    df_final.reset_index(drop=True, inplace=True)
+
+    if (len(df_final.loc[df_final["filter"] == "r"]) <= 2 or
+        len(df_final.loc[df_final["filter"] == "g"]) <= 2):
+        logger.warning("[%s] Not enough points", source_id)
+        return None
+
+    # Add filter metadata for SNAPI
+    df_final["filt_center"] = np.where(df_final["filter"] == "r", 6366.38, 4746.48)
+    df_final["filt_width"] = np.where(df_final["filter"] == "r", 1553.43, 1317.15)
+    df_final["filter"] = np.where(df_final["filter"] == "r", "ZTF_r", "ZTF_g")
+    df_final["zeropoint"] = 23.90
+    df_final["upper_limit"] = False
+
+    # Create SNAPI photometry object
+    phot = Photometry(df_final)
+
+    # Merge close-time observations
+    new_lcs = []
+    for lc in phot.light_curves:
+        lc.merge_close_times(inplace=True)
+        new_lcs.append(lc)
+
+    phot = Photometry.from_light_curves(new_lcs)
+    phot.upper_limit = False
+
+    # Phase and truncate
+    phot.phase(inplace=True)
+    phot.truncate(min_t=-50.0, max_t=100.0)
+
+    if phot.detections.empty or phot.detections["flux"].dropna().empty:
+        logger.warning("[%s] No valid detections after truncation", source_id)
+        return None
+
+    # Extinction correction using median ra/dec from the CSV
+    median_ra = raw["ra"].dropna().median()
+    median_dec = raw["dec"].dropna().median()
+    phot.correct_extinction(
+        coordinates=SkyCoord(ra=median_ra * u.deg, dec=median_dec * u.deg),
+        inplace=True,
+    )
+
+    redshift = np.nan
+
+    phot_abs = phot.absolute(redshift)
+    peak_abs_mag = phot_abs.detections.mag.dropna().min()
+
+    phot.normalize(inplace=True)
+
+    for filt in phot._unique_filters:
+        filt_data = phot.detections[phot.detections["filter"] == filt]
+        if filt_data.empty:
+            logger.warning("[%s] Filter %s empty after normalization", source_id, filt)
+            return None
+
+    # Pad light curves
+    padded_lcs = []
+    orig_size = len(phot.detections)
+    num_pad = int(2 ** np.ceil(np.log2(orig_size)))
+    fill = {
+        "phase": 1000.0,
+        "flux": 0.1,
+        "flux_error": 1000.0,
+        "zeropoint": 23.90,
+        "upper_limit": False,
+    }
+
+    for lc in phot.light_curves:
+        padded_lc = lc.pad(fill, num_pad - len(lc.detections))
+        padded_lcs.append(padded_lc)
+    padded_phot = Photometry.from_light_curves(padded_lcs)
+
+    # Fit using SVI sampler
+    priors = SuperphotPrior.load("../../data/models/global_priors_hier_svi")
+    random_seed = 42
+
+    try:
+        svi_sampler = SVISampler(
+            priors=priors,
+            num_iter=3000,
+            random_state=random_seed,
+        )
+        svi_sampler.fit_photometry(padded_phot, orig_num_times=orig_size)
+    except Exception:
+        logger.exception("[%s] SVI sampler failed", source_id)
+        return None
+
+    res = svi_sampler.result
+
+    event_dict = {}
+    for param in res.fit_parameters.columns:
+        event_dict[f"superphot_plus_{param}"] = float(res.fit_parameters[param].median())
+
+    score_cutoff = 1.2
+    if orig_size >= 6:
+        valid_fits = res.fit_parameters[res.score <= score_cutoff]
+    else:
+        valid_fits = res.fit_parameters
+
+    if valid_fits.empty:
+        logger.warning("[%s] Empty fits", source_id)
+        return None
+
+    try:
+        early_fit_mask = (
+            valid_fits["gamma_ZTF_r"] + valid_fits["t_0_ZTF_r"] > np.max(phot.times)
+        )
+    except UnboundLocalError:
+        logger.warning("[%s] No valid returns", source_id)
+        return None
+
+    uncorr_fits = priors.reverse_transform(valid_fits)
+    event_dict["name"] = str(source_id)
+    uncorr_fits.index = [event_dict["name"]] * len(uncorr_fits)
+
+    # Load classification models
+    full_model_fn = "../../data/models/model_superphot_full.pt"
+    early_model_fn = "../../data/models/model_superphot_early.pt"
+
+    full_model = SuperphotLightGBM.load(full_model_fn)
+    early_model = SuperphotLightGBM.load(early_model_fn)
+
+    if len(valid_fits[early_fit_mask]) > len(valid_fits[~early_fit_mask]):
+        class_noz, prob_noz, all_probs_noz = evaluate_cal_probs(early_model, uncorr_fits)
+        event_dict["superphot_plus_classifier"] = "early_lightgbm_02_2025"
+    else:
+        class_noz, prob_noz, all_probs_noz = evaluate_cal_probs(full_model, uncorr_fits)
+        event_dict["superphot_plus_classifier"] = "full_lightgbm_02_2025"
+
+    event_dict["superphot_plus_class"] = class_noz
+    event_dict["superphot_plus_prob"] = float(np.round(prob_noz, 3))
+
+    for cls, cls_prob in all_probs_noz.items():
+        event_dict[f"superphot_plus_prob_{cls}"] = float(np.round(cls_prob, 3))
+
+    event_dict["superphot_plus_classified"] = True
+
+    image_path = None
+    if event_dict["superphot_plus_prob"] > 0.5:
+        os.makedirs("superphot_results", exist_ok=True)
+        fig, ax = plt.subplots(figsize=(8, 6))
+        formatter = Formatter()
+        ax = svi_sampler.plot_fit(ax, formatter, phot)
+        phot.plot(ax, formatter, mags=False)
+        formatter.add_legend(ax)
+        formatter.make_plot_pretty(ax)
+        ax.set_xlabel("Phase", fontsize=15)
+        ax.set_ylabel("Flux", fontsize=15)
+        ax.tick_params(axis="both", which="major", labelsize=15)
+        ax.legend()
+        plt.title(
+            f"{source_id}, Class: {event_dict['superphot_plus_class']}, "
+            f"Probability: {event_dict['superphot_plus_prob']}",
+            fontsize=18,
+        )
+        image_path = f"superphot_results/{source_id}_superphot.png"
+        plt.savefig(image_path)
+        plt.close(fig)
+
+    import gc
+    gc.collect()
+    jax.clear_caches()
+
+    return event_dict, image_path
+
+
+def run_batch_from_csv(csv_dir="data/photometry", output_dir="superphot_results"):
+    """
+    Process all CSV files in a directory and save results locally.
+
+    For each CSV, runs the Superphot Plus pipeline and writes:
+    - A combined results CSV at <output_dir>/superphot_results_lsst_batch.csv
+    - Individual JSON results at <output_dir>/<source_id>.json
+    - Diagnostic plots at <output_dir>/<source_id>_superphot.png
+
+    Args:
+        csv_dir (str): Directory containing photometry CSV files.
+        output_dir (str): Directory to save outputs.
+    """
+    csv_dir = Path(csv_dir)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    csv_files = sorted(csv_dir.glob("*.csv"))
+    logger.info("Found %d CSV files in %s", len(csv_files), csv_dir)
+
+    results_csv = output_dir / "superphot_results_lsst_batch.csv"
+    header_written = results_csv.exists()
+
+    for i, csv_path in enumerate(csv_files):
+        source_id = csv_path.stem
+        logger.info("[%d/%d] Processing %s", i + 1, len(csv_files), source_id)
+
+        try:
+            result = run_superphot_from_csv(csv_path)
+        except Exception:
+            logger.exception("[%s] Failed", source_id)
+            continue
+
+        if result is None:
+            logger.warning("[%s] No result", source_id)
+            continue
+
+        event_dict, image_path = result
+        if event_dict is None:
+            logger.warning("[%s] Empty classification", source_id)
+            continue
+
+        # Save individual JSON
+        json_path = output_dir / f"{source_id}.json"
+        with open(json_path, "w") as f:
+            json.dump(event_dict, f, indent=2, cls=NumpyEncoder)
+
+        # Append to combined CSV
+        row = pd.DataFrame([event_dict])
+        row.to_csv(results_csv, mode="a", index=False, header=not header_written)
+        header_written = True
+
+        logger.info("[%s] Saved results to %s and %s", source_id, json_path, results_csv)

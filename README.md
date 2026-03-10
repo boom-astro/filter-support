@@ -14,6 +14,10 @@ LSST_alerts_results → alerts_consumer_lsst.py → superphot_boom_lsst.py → F
 ZTF_alerts_results  → alerts_consumer_ztf.py  → superphot_boom_ztf.py  → Fritz annotations
                                                                            → CSV results
                                                                            → diagnostic plots
+
+Local CSV files     → run_superphot_from_csv()                         → JSON results
+(data/photometry/)  → run_batch_from_csv()                             → CSV results
+                                                                           → diagnostic plots
 ```
 
 ## Project Structure
@@ -26,6 +30,7 @@ filter-support/
 │   ├── alerts_consumer_lsst.py     # LSST Kafka consumer
 │   ├── alerts_consumer_ztf.py      # ZTF Kafka consumer
 │   └── superphot_results/          # Output diagnostic plots
+├── data/photometry/                   # Local CSV photometry files (500 ZTF sources)
 ├── data/models/
 │   ├── global_priors_hier_svi/     # SVI sampler priors
 │   ├── model_superphot_full.pt     # Full-phase LightGBM classifier
@@ -53,6 +58,45 @@ Each `run_superphot()` call performs the following:
 11. Generate diagnostic plot (if probability > 0.5)
 
 Returns `(event_dict, image_path)` with per-class probabilities for: SLSN-I, SN Ia, SN Ibc, SN II, SN IIn.
+
+## Running from Local CSV Files
+
+Both pipeline modules support direct CSV input, bypassing Kafka and MongoDB entirely. This is useful for batch-processing archival photometry stored locally.
+
+The `data/photometry/` directory contains CSV files for 500 random ZTF sources. Each CSV has standard ZTF alert columns (`jd`, `fid`, `magpsf`, `sigmapsf`, `ra`, `dec`, etc.).
+
+### Single source
+
+```python
+from filter_support.superphot_boom_ztf import run_superphot_from_csv
+
+result = run_superphot_from_csv("data/photometry/ZTF17aabuqoz.csv")
+if result:
+    event_dict, image_path = result
+```
+
+### Batch processing (all 500 sources)
+
+```python
+from filter_support.superphot_boom_ztf import run_batch_from_csv
+
+run_batch_from_csv("data/photometry", "superphot_results")
+```
+
+The LSST module exposes the same functions:
+
+```python
+from filter_support.superphot_boom_lsst import run_superphot_from_csv, run_batch_from_csv
+```
+
+### Batch outputs
+
+| File | Description |
+|---|---|
+| `superphot_results/<source_id>.json` | Per-source classification results |
+| `superphot_results/superphot_results_ztf_batch.csv` | Combined results (ZTF module) |
+| `superphot_results/superphot_results_lsst_batch.csv` | Combined results (LSST module) |
+| `superphot_results/<source_id>_superphot.png` | Diagnostic plot (if probability > 0.5) |
 
 ## Consumers
 
@@ -82,7 +126,7 @@ The `annotate_fritz()` function handles both creation and update: if a POST fail
 
 ## Setup
 
-**Note:** This pipeline can only be run from a machine with access to the [BOOM](https://github.com/boom-astro) database (MongoDB) and the Kafka alert streams (`LSST_alerts_results`, `ZTF_alerts_results`).
+**Note:** The Kafka consumers require access to the [BOOM](https://github.com/boom-astro) database (MongoDB) and the Kafka alert streams. The CSV-based functions (`run_superphot_from_csv`, `run_batch_from_csv`) only require the model files and local photometry CSVs -- no MongoDB or Kafka needed.
 
 ### Requirements
 
@@ -118,6 +162,9 @@ python alerts_consumer_lsst.py
 
 # Run ZTF consumer (separate terminal)
 python alerts_consumer_ztf.py
+
+# Batch-process local CSV photometry (no Kafka/MongoDB required)
+python -c "from filter_support.superphot_boom_ztf import run_batch_from_csv; run_batch_from_csv()"
 ```
 
 

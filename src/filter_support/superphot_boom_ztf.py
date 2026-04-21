@@ -48,7 +48,7 @@ class NumpyEncoder(json.JSONEncoder):
 load_dotenv(Path.home() / ".env")
 
 
-def fetch_mongo(collection_name, url="mongodb://localhost:27017", db_name="boom"):
+def fetch_mongo(collection_name, url=None, db_name="boom"):
     """
     Fetch a MongoDB collection.
 

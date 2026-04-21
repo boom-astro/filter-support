@@ -1,2 +1,5 @@
 __pycache__
 test_new_filter
+*.json
+*.log
+*.csv

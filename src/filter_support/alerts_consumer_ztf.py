@@ -9,7 +9,7 @@ import fastavro
 import pandas as pd
 from confluent_kafka import Consumer
 
-from filter_support.superphot_boom_ztf import run_superphot, post_to_fritz_with_replace, annotate_fritz
+from superphot_boom_ztf import run_superphot, post_to_fritz_with_replace, annotate_fritz
 
 # --- Configuration ---
 CSV_FILE = "superphot_results_ztf.csv"

@@ -106,9 +106,15 @@ def process_photometry(cand_info, source):
     candidates = cand_info["prv_candidates"]
     forced_photometry = cand_info["fp_hists"]
     data_dict_list = []
-    
+
+    # Only keep public-survey programs (1 = ZTF public, 2 = partnership);
+    # exclude programid 0 and 3.
+    allowed_programids = {1, 2}
+
     # Process alert candidates
     for obj in candidates:
+        if obj.get("programid") not in allowed_programids:
+            continue
         temp_dict = {
             "mjd": obj["jd"] - 2400000.5,
             "mag": obj["magpsf"],
@@ -121,6 +127,8 @@ def process_photometry(cand_info, source):
 
     # Process forced photometry
     for obj in forced_photometry:
+        if obj.get("programid") not in allowed_programids:
+            continue
         if "magpsf" in obj:
             temp_dict = {
                 "mjd": obj["jd"] - 2400000.5,

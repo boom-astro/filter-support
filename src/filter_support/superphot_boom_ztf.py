@@ -107,9 +107,8 @@ def process_photometry(cand_info, source):
     forced_photometry = cand_info["fp_hists"]
     data_dict_list = []
 
-    # Only keep public-survey programs (1 = ZTF public, 2 = partnership);
-    # exclude programid 0 and 3.
-    allowed_programids = {1, 2}
+    # Only keep public-survey data (programid 1); exclude 0, 2, and 3.
+    allowed_programids = {1}
 
     # Process alert candidates
     for obj in candidates:
